@@ -13,7 +13,7 @@ ACLOCAL_AMFLAGS = -I m4 ${ACLOCAL_FLAGS}
 lib_LTLIBRARIES = libcircle.la
 
 libcircle_la_LIBADD = $(MPI_CLDFLAGS)
-libcircle_la_LDFLAGS = -version-info $(LIBCIRCLE_SO_VERSION)
+libcircle_la_LDFLAGS = -version-info $(LIBCIRCLE_SO_VERSION) -Wl,-export-dynamic
 libcircle_la_SOURCES = \
         libcircle/lib.c \
         libcircle/queue.c \
