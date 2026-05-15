@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <execinfo.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -54,6 +55,16 @@ static void CIRCLE_MPI_error_handler(MPI_Comm* comm, int* err, ...)
         int error_len = 0;
         MPI_Error_string(*err, error, &error_len);
         LOG(CIRCLE_LOG_ERR, "MPI Error in Comm [%s]: %s", name, error);
+        {
+            void* frames[64];
+            int nframes = backtrace(frames, 64);
+            char** symbols = backtrace_symbols(frames, nframes);
+            LOG(CIRCLE_LOG_ERR, "Stack trace (%d frames):", nframes);
+            for(int i = 0; i < nframes; i++) {
+                LOG(CIRCLE_LOG_ERR, "  #%d %s", i, symbols ? symbols[i] : "?");
+            }
+            free(symbols);
+        }
         LOG(CIRCLE_LOG_ERR, "Libcircle received MPI error, checkpointing.");
     }
 
