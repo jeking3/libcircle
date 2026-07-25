@@ -106,8 +106,21 @@ typedef struct CIRCLE_state_st {
 
     /* profiling counters */
     int32_t local_objects_processed; /* number of locally completed work items */
-    uint32_t local_work_requested;   /* number of times a process asked us for work */
-    uint32_t local_no_work_received; /* number of times a process asked us for work */
+    uint32_t local_work_requested;   /* number of work requests we have sent to others */
+    uint32_t local_no_work_received; /* number of "no work" replies we have received */
+
+    /* work-distribution instrumentation, enabled via CIRCLE_INSTRUMENT=<secs>;
+     * when instr_interval <= 0 all instrumentation is disabled (no timing,
+     * no counters, no output) */
+    int      instr_interval;     /* sample interval in seconds; 0 disables */
+    double   instr_last;         /* MPI_Wtime of last emitted sample */
+    double   instr_t_in_cb;      /* seconds in process callback this interval */
+    int32_t  instr_proc_last;    /* local_objects_processed at last sample */
+    uint64_t instr_shared_items; /* total work items handed to other ranks */
+    uint64_t instr_shared_evt;   /* number of transfers we sent (count > 0) */
+    uint64_t instr_shared_max;   /* largest single transfer we sent */
+    uint64_t instr_recv_items;   /* total work items received from other ranks */
+    uint64_t instr_recv_evt;     /* number of transfers we received (count > 0) */
 } CIRCLE_state_st;
 
 /* given the rank of the calling process, the number of ranks in the job,
