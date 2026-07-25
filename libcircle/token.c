@@ -1237,6 +1237,12 @@ static int32_t CIRCLE_work_receive(
     /* we now have count items in our queue */
     qp->count = count;
 
+    /* instrumentation: record work we received from another rank */
+    if(st->instr_interval > 0) {
+        st->instr_recv_items += (uint64_t) count;
+        st->instr_recv_evt++;
+    }
+
     /* set head of queue to point just past end of last element string */
     uintptr_t elem_offset = qp->strings[count - 1];
     const char* elem_str = qp->base + elem_offset;
@@ -1465,6 +1471,15 @@ static int CIRCLE_send_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, \
 
     /* track number of outstanding messages that transfer work */
     st->work_outstanding++;
+
+    /* instrumentation: record work we handed off to another rank */
+    if(st->instr_interval > 0) {
+        st->instr_shared_items += (uint64_t) count;
+        st->instr_shared_evt++;
+        if((uint64_t) count > st->instr_shared_max) {
+            st->instr_shared_max = (uint64_t) count;
+        }
+    }
 
     return 0;
 }

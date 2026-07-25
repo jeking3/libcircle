@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <time.h>
 #include <mpi.h>
 
 #include "log.h"
@@ -254,12 +255,84 @@ static void CIRCLE_finalize_local_state(CIRCLE_state_st* local_state)
  *     -# If after requesting work, this rank still doesn't have any,
  *        check for termination conditions.
  */
+/**
+ * Emit one per-rank work-distribution instrumentation line.
+ *
+ * Controlled entirely by the CIRCLE_INSTRUMENT environment variable, which
+ * gives the sample interval in seconds; a value <= 0 disables everything.
+ * Fields: qdepth (current local queue depth), processed (lifetime items this
+ * rank completed) with per-interval delta/rate, req/nowork (work requests we
+ * sent and "no work" replies we got), shared_* (work we handed to peers),
+ * recv_* (work we received from peers), and cbfrac (fraction of this interval
+ * spent inside the process callback -- high values mean the rank is too busy
+ * doing work to service steal requests). The shared and recv counters are
+ * lifetime totals; diff consecutive lines for per-interval values.
+ */
+static void CIRCLE_instr_emit(CIRCLE_state_st* st, int final)
+{
+    if(st->instr_interval <= 0) {
+        return;
+    }
+
+    double now = MPI_Wtime();
+    if(!final && (now - st->instr_last) < (double) st->instr_interval) {
+        return;
+    }
+
+    uint32_t qdepth = CIRCLE_INPUT_ST.queue->count;
+    int32_t  delta  = st->local_objects_processed - st->instr_proc_last;
+    double   dt     = now - st->instr_last;
+    double   rate   = (dt > 0.0) ? (double) delta / dt : 0.0;
+    double   cbfrac = (dt > 0.0) ? (st->instr_t_in_cb / dt) : 0.0;
+
+    char ts[32];
+    time_t lt = time(NULL);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&lt));
+
+    fprintf(stdout,
+            "[%s] [CIRCLEINSTR]%s rank=%d qdepth=%" PRIu32
+            " processed=%" PRId32 " delta=%" PRId32 " rate=%.0f/s"
+            " req=%" PRIu32 " nowork=%" PRIu32
+            " shared_items=%" PRIu64 " shared_evt=%" PRIu64 " shared_max=%" PRIu64
+            " recv_items=%" PRIu64 " recv_evt=%" PRIu64 " cbfrac=%.2f\n",
+            ts, final ? " FINAL" : "", st->rank, qdepth,
+            st->local_objects_processed, delta, rate,
+            st->local_work_requested, st->local_no_work_received,
+            st->instr_shared_items, st->instr_shared_evt, st->instr_shared_max,
+            st->instr_recv_items, st->instr_recv_evt, cbfrac);
+    fflush(stdout);
+
+    /* start a fresh interval; shared and recv counters stay cumulative */
+    st->instr_last = now;
+    st->instr_proc_last = st->local_objects_processed;
+    st->instr_t_in_cb = 0.0;
+}
+
 static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
 {
     int cleanup = 0;
 
+    /* initialize work-distribution instrumentation; disabled unless
+     * CIRCLE_INSTRUMENT is set to a positive number of seconds */
+    {
+        const char* envstr = getenv("CIRCLE_INSTRUMENT");
+        sptr->instr_interval     = (envstr != NULL) ? atoi(envstr) : 0;
+        sptr->instr_last         = MPI_Wtime();
+        sptr->instr_t_in_cb      = 0.0;
+        sptr->instr_proc_last    = sptr->local_objects_processed;
+        sptr->instr_shared_items = 0;
+        sptr->instr_shared_evt   = 0;
+        sptr->instr_shared_max   = 0;
+        sptr->instr_recv_items   = 0;
+        sptr->instr_recv_evt     = 0;
+    }
+
     /* Loop until done, we break on normal termination or abort */
     while(1) {
+        /* emit a periodic instrumentation sample (no-op unless enabled);
+         * placed here so idle ranks report too, not just busy ones */
+        CIRCLE_instr_emit(sptr, 0);
+
         /* Check for and service work requests */
         CIRCLE_workreq_check(CIRCLE_INPUT_ST.queue, sptr, cleanup);
 
@@ -282,7 +355,16 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
         /* If I have some work and have not received a signal to
          * abort, process one work item */
         if(CIRCLE_INPUT_ST.queue->count > 0 && !CIRCLE_ABORT_FLAG) {
-            (*(CIRCLE_INPUT_ST.process_cb))(q_handle);
+            if(sptr->instr_interval > 0) {
+                /* time the process callback so we can see how much of the
+                 * interval a rank spends doing work vs. able to share it */
+                double cb_start = MPI_Wtime();
+                (*(CIRCLE_INPUT_ST.process_cb))(q_handle);
+                sptr->instr_t_in_cb += MPI_Wtime() - cb_start;
+            }
+            else {
+                (*(CIRCLE_INPUT_ST.process_cb))(q_handle);
+            }
             sptr->local_objects_processed++;
         }
         /* If I don't have work, or if I received signal to abort,
@@ -300,6 +382,8 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
             if(term_status == TERMINATE) {
                 /* got the terminate signal, break the loop */
                 LOG(CIRCLE_LOG_DBG, "Received termination signal.");
+                /* emit final per-rank totals before we leave the loop */
+                CIRCLE_instr_emit(sptr, 1);
                 break;
             }
         }
