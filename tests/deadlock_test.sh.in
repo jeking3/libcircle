@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# Run check_deadlock under a tiny eager limit so that essentially every
+# message goes rendezvous.  A rendezvous send does not complete until
+# the peer posts a matching receive, so if libcircle blocks anywhere on
+# the work transfer path, a cycle in the work request graph hangs the
+# job and the timeout below fires.
+#
+# Exits 77 (automake SKIP) when there is nothing to run with.
+
+MPIRUN="@MPIRUN@"
+RANKS="${LIBCIRCLE_TEST_RANKS:-16}"
+TIMEOUT="${LIBCIRCLE_TEST_TIMEOUT:-180}"
+PROG="./check_deadlock"
+
+if [ ! -x "$PROG" ]; then
+    echo "SKIP: $PROG was not built"
+    exit 77
+fi
+
+if [ -z "$MPIRUN" ] || [ "$MPIRUN" = "none" ] || ! command -v "$MPIRUN" >/dev/null 2>&1; then
+    echo "SKIP: no MPI launcher available"
+    exit 77
+fi
+
+# Force rendezvous for all but the smallest messages.  Each MPI
+# implementation ignores the other's settings.
+#
+# Open MPI
+OMPI_MCA_btl_self_eager_limit=128
+OMPI_MCA_btl_sm_eager_limit=128
+OMPI_MCA_btl_vader_eager_limit=128
+OMPI_MCA_btl_tcp_eager_limit=128
+export OMPI_MCA_btl_self_eager_limit OMPI_MCA_btl_sm_eager_limit
+export OMPI_MCA_btl_vader_eager_limit OMPI_MCA_btl_tcp_eager_limit
+
+# MPICH
+MPIR_CVAR_CH3_EAGER_MAX_MSG_SIZE=128
+MPIR_CVAR_CH4_OFI_EAGER_MAX_MSG_SIZE=128
+export MPIR_CVAR_CH3_EAGER_MAX_MSG_SIZE MPIR_CVAR_CH4_OFI_EAGER_MAX_MSG_SIZE
+
+# We ask for more ranks than the machine is likely to have cores.
+# Open MPI 4 and Open MPI 5 spell this differently; both are harmless
+# to the other, and to MPICH.
+OMPI_MCA_rmaps_base_oversubscribe=1
+PRTE_MCA_rmaps_default_mapping_policy=:oversubscribe
+export OMPI_MCA_rmaps_base_oversubscribe PRTE_MCA_rmaps_default_mapping_policy
+
+# Running as root in a container needs this for Open MPI.
+if [ "$(id -u)" = "0" ]; then
+    OMPI_ALLOW_RUN_AS_ROOT=1
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    export OMPI_ALLOW_RUN_AS_ROOT OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+fi
+
+echo "running $RANKS ranks, timeout ${TIMEOUT}s, eager limit 128 bytes"
+
+if command -v timeout >/dev/null 2>&1; then
+    timeout -s KILL "$TIMEOUT" "$MPIRUN" -n "$RANKS" "$PROG"
+    rc=$?
+else
+    echo "WARNING: no timeout(1), a hang will not be caught automatically"
+    "$MPIRUN" -n "$RANKS" "$PROG"
+    rc=$?
+fi
+
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    echo "FAIL: job did not finish within ${TIMEOUT}s, libcircle is deadlocked"
+    echo "      collect stacks with: gdb -p <pid> -batch -ex 'bt full'"
+    exit 1
+fi
+
+exit "$rc"

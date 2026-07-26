@@ -20,6 +20,10 @@ X_AC_LIBCIRCLE_PKG_CONFIG
 X_AC_LIBCIRCLE_CHECK
 AM_CONDITIONAL([HAVE_CHECK], [test x$x_ac_libcircle_check = xyes])
 
+# Launcher used by the multi-rank regression test.  That test skips
+# itself when no launcher is found, so this is not fatal.
+AC_CHECK_PROGS([MPIRUN], [mpirun mpiexec], [none])
+
 # Needed for docs
 X_AC_LIBCIRCLE_DOXYGEN
 
@@ -45,7 +49,7 @@ AC_FUNC_MALLOC
 # - Always increase the revision value.
 # - Increase the current value whenever an interface has been added, removed or changed.
 # - Increase the age value only if the changes made to the ABI are backward compatible.
-AC_SUBST([LIBCIRCLE_SO_VERSION], [3:1:1])
+AC_SUBST([LIBCIRCLE_SO_VERSION], [3:2:1])
 
 # Use Semantic Versioning for API
 #
