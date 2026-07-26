@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
+#include <unistd.h>
 #include <mpi.h>
 
 #include "log.h"
@@ -267,7 +268,12 @@ static void CIRCLE_finalize_local_state(CIRCLE_state_st* local_state)
  * spent inside the process callback -- high values mean the rank is too busy
  * doing work to service steal requests). The shared and recv counters are
  * lifetime totals; diff consecutive lines for per-interval values.
+ *
+ * host= identifies the node this rank landed on (slurm places tasks freely,
+ * so rank->node is not predictable); captured once in CIRCLE_work_loop.
  */
+static char CIRCLE_instr_host[256] = "";
+
 static void CIRCLE_instr_emit(CIRCLE_state_st* st, int final)
 {
     if(st->instr_interval <= 0) {
@@ -290,12 +296,12 @@ static void CIRCLE_instr_emit(CIRCLE_state_st* st, int final)
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&lt));
 
     fprintf(stdout,
-            "[%s] [CIRCLEINSTR]%s rank=%d qdepth=%" PRIu32
+            "[%s] [CIRCLEINSTR]%s rank=%d host=%s qdepth=%" PRIu32
             " processed=%" PRId32 " delta=%" PRId32 " rate=%.0f/s"
             " req=%" PRIu32 " nowork=%" PRIu32
             " shared_items=%" PRIu64 " shared_evt=%" PRIu64 " shared_max=%" PRIu64
             " recv_items=%" PRIu64 " recv_evt=%" PRIu64 " cbfrac=%.2f\n",
-            ts, final ? " FINAL" : "", st->rank, qdepth,
+            ts, final ? " FINAL" : "", st->rank, CIRCLE_instr_host, qdepth,
             st->local_objects_processed, delta, rate,
             st->local_work_requested, st->local_no_work_received,
             st->instr_shared_items, st->instr_shared_evt, st->instr_shared_max,
@@ -325,6 +331,10 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
         sptr->instr_shared_max   = 0;
         sptr->instr_recv_items   = 0;
         sptr->instr_recv_evt     = 0;
+        if(gethostname(CIRCLE_instr_host, sizeof(CIRCLE_instr_host)) != 0) {
+            CIRCLE_instr_host[0] = '\0';
+        }
+        CIRCLE_instr_host[sizeof(CIRCLE_instr_host) - 1] = '\0';
     }
 
     /* Loop until done, we break on normal termination or abort */
