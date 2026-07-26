@@ -1095,6 +1095,123 @@ CIRCLE_get_next_proc(CIRCLE_state_st* st)
     }
 }
 
+/* Record a non-blocking send so that we can free its buffer once the
+ * send has completed.  Takes ownership of buf, which may be NULL for
+ * messages that carry no payload. */
+static void CIRCLE_worksend_track(CIRCLE_state_st* st, MPI_Request req, void* buf)
+{
+    /* grow our arrays if we've run out of room */
+    if(st->send_count == st->send_capacity) {
+        int capacity = (st->send_capacity > 0) ? st->send_capacity * 2 : 32;
+
+        MPI_Request* reqs = (MPI_Request*) realloc(st->send_reqs,
+                                (size_t)capacity * sizeof(MPI_Request));
+        void** bufs = (void**) realloc(st->send_bufs,
+                                (size_t)capacity * sizeof(void*));
+
+        if(reqs == NULL || bufs == NULL) {
+            LOG(CIRCLE_LOG_FATAL, "Failed to allocate memory to track sends.");
+            MPI_Abort(st->comm, LIBCIRCLE_MPI_ERROR);
+            return;
+        }
+
+        st->send_reqs     = reqs;
+        st->send_bufs     = bufs;
+        st->send_capacity = capacity;
+    }
+
+    st->send_reqs[st->send_count] = req;
+    st->send_bufs[st->send_count] = buf;
+    st->send_count++;
+
+    return;
+}
+
+/* Test each outstanding send and free the buffer of any that have
+ * completed.  This never blocks, so a process that cannot push a
+ * message out just accumulates a request here while it continues to
+ * service everyone else. */
+void CIRCLE_worksend_check(CIRCLE_state_st* st)
+{
+    /* walk the list backwards so we can swap the last entry into the
+     * slot of a completed send without disturbing entries we have yet
+     * to visit */
+    int i;
+
+    for(i = st->send_count - 1; i >= 0; i--) {
+        int flag;
+        MPI_Test(&st->send_reqs[i], &flag, MPI_STATUS_IGNORE);
+
+        if(! flag) {
+            continue;
+        }
+
+        /* send completed, so it's safe to release its buffer */
+        CIRCLE_free(&st->send_bufs[i]);
+
+        /* fill this slot with the last entry in the list */
+        st->send_count--;
+        st->send_reqs[i] = st->send_reqs[st->send_count];
+        st->send_bufs[i] = st->send_bufs[st->send_count];
+    }
+
+    return;
+}
+
+/* Wait for every outstanding send to complete and release its buffer.
+ *
+ * Only call this once the cleanup barrier has completed.  At that point
+ * every process has received everything we sent it, so these sends have
+ * all been matched and the waits return promptly.  We cannot simply
+ * abandon the requests: their buffers are not ours to free until MPI is
+ * done reading them.
+ *
+ * There is a race that makes this necessary even though the barrier is
+ * only started once we have no sends outstanding.  A process can be
+ * asked for work after it starts the barrier, and it answers with a
+ * "no work" reply.  The barrier can then complete before that reply's
+ * request has been reaped. */
+void CIRCLE_worksend_wait(CIRCLE_state_st* st)
+{
+    if(st->work_request_req != MPI_REQUEST_NULL) {
+        MPI_Wait(&st->work_request_req, MPI_STATUS_IGNORE);
+    }
+
+    if(st->send_count > 0) {
+        MPI_Waitall(st->send_count, st->send_reqs, MPI_STATUSES_IGNORE);
+
+        int i;
+
+        for(i = 0; i < st->send_count; i++) {
+            CIRCLE_free(&st->send_bufs[i]);
+        }
+
+        st->send_count = 0;
+    }
+
+    return;
+}
+
+/* free memory used to track outstanding sends */
+void CIRCLE_worksend_free(CIRCLE_state_st* st)
+{
+    /* CIRCLE_worksend_wait drains these before we get here, so anything
+     * left means we tore down early.  Don't free the buffers, since MPI
+     * may still be reading them. */
+    if(st->send_count > 0) {
+        LOG(CIRCLE_LOG_ERR, "Freeing state with %d outstanding sends.",
+            st->send_count);
+    }
+
+    CIRCLE_free(&st->send_reqs);
+    CIRCLE_free(&st->send_bufs);
+
+    st->send_count    = 0;
+    st->send_capacity = 0;
+
+    return;
+}
+
 /**
  * @brief Extend the offset arrays.
  */
@@ -1120,21 +1237,14 @@ int8_t CIRCLE_extend_offsets(CIRCLE_state_st* st, int32_t size)
     st->offsets_recv_buf = (int*) realloc(st->offsets_recv_buf,
                                           (size_t)count * sizeof(int));
 
-    st->offsets_send_buf = (int*) realloc(st->offsets_send_buf,
-                                          (size_t)count * sizeof(int));
-
     LOG(CIRCLE_LOG_DBG, "Work offsets: [%p] -> [%p]",
         (void*) st->offsets_recv_buf,
         (void*)(st->offsets_recv_buf + ((size_t)count * sizeof(int))));
 
-    LOG(CIRCLE_LOG_DBG, "Request offsets: [%p] -> [%p]",
-        (void*) st->offsets_send_buf,
-        (void*)(st->offsets_send_buf + ((size_t)count * sizeof(int))));
-
     /* record new length of offset arrays */
     st->offsets_count = count;
 
-    if(st->offsets_recv_buf == NULL || st->offsets_send_buf == NULL) {
+    if(st->offsets_recv_buf == NULL) {
         return -1;
     }
 
@@ -1254,8 +1364,10 @@ static int32_t CIRCLE_work_receive(
 
     /* send receipt back to source to notify we are now
      * accounting for this work */
-    MPI_Send(NULL, 0, MPI_BYTE, source,
-        CIRCLE_TAG_WORK_RECEIPT, comm);
+    MPI_Request req;
+    MPI_Isend(NULL, 0, MPI_BYTE, source,
+              CIRCLE_TAG_WORK_RECEIPT, comm, &req);
+    CIRCLE_worksend_track(st, req, NULL);
 
     return 0;
 }
@@ -1273,6 +1385,14 @@ int32_t CIRCLE_request_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, in
 
     /* get communicator */
     MPI_Comm comm = st->comm;
+
+    /* our previous work request message may still be working its way
+     * out, we can't post another until it has gone */
+    int request_slot_free = 1;
+
+    if(st->work_request_req != MPI_REQUEST_NULL) {
+        MPI_Test(&st->work_request_req, &request_slot_free, MPI_STATUS_IGNORE);
+    }
 
     /* check whether we have a work request outstanding, and check for
      * a reply if we do, otherwise send a request so long as we're not
@@ -1302,7 +1422,7 @@ int32_t CIRCLE_request_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, in
             st->work_requested = 0;
         }
     }
-    else if(!cleanup && !CIRCLE_ABORT_FLAG) {
+    else if(!cleanup && !CIRCLE_ABORT_FLAG && request_slot_free) {
         /* need to send request, get rank of process to request work from */
         int source = st->next_processor;
 
@@ -1316,10 +1436,13 @@ int32_t CIRCLE_request_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, in
         /* increment number of work requests for profiling */
         st->local_work_requested++;
 
-        /* TODO: use isend to avoid deadlocks */
-        /* send work request */
-        MPI_Send(NULL, 0, MPI_BYTE, source,
-                 CIRCLE_TAG_WORK_REQUEST, comm);
+        /* send work request, this must not block: a process sitting in
+         * a blocking send services no incoming messages, which stalls
+         * every process waiting on it and can hang the whole job.  if
+         * the transport is backed up we simply stop asking for work
+         * while continuing to service everyone else */
+        MPI_Isend(NULL, 0, MPI_BYTE, source,
+                  CIRCLE_TAG_WORK_REQUEST, comm, &st->work_request_req);
 
         /* set flag and source to indicate we requested work */
         st->work_requested = 1;
@@ -1358,16 +1481,26 @@ static void spread_counts(int* sizes, int ranks, int count)
 /**
  * Sends a no work reply to someone requesting work.
  */
-void CIRCLE_send_no_work(int dest)
+void CIRCLE_send_no_work(CIRCLE_state_st* st, int dest)
 {
-    int no_work[2];
+    /* the buffer has to outlive this call, since we don't wait on the
+     * send, so allocate it and hand it off to be freed when the send
+     * completes */
+    int* no_work = (int*) malloc(2 * sizeof(int));
+
+    if(no_work == NULL) {
+        LOG(CIRCLE_LOG_FATAL, "Failed to allocate memory for a work reply.");
+        MPI_Abort(st->comm, LIBCIRCLE_MPI_ERROR);
+        return;
+    }
+
     no_work[0] = (CIRCLE_ABORT_FLAG) ? PAYLOAD_ABORT : 0;
     no_work[1] = 0;
 
-    MPI_Request r;
-    MPI_Isend(&no_work, 1, MPI_INT, dest,
-              CIRCLE_TAG_WORK_REPLY, CIRCLE_INPUT_ST.comm, &r);
-    MPI_Wait(&r, MPI_STATUS_IGNORE);
+    MPI_Request req;
+    MPI_Isend(no_work, 1, MPI_INT, dest,
+              CIRCLE_TAG_WORK_REPLY, st->comm, &req);
+    CIRCLE_worksend_track(st, req, no_work);
 }
 
 /**
@@ -1377,7 +1510,7 @@ static int CIRCLE_send_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, \
                             int dest, int32_t count)
 {
     if(count <= 0) {
-        CIRCLE_send_no_work(dest);
+        CIRCLE_send_no_work(st, dest);
         /* Add cost of message */
         return 0;
     }
@@ -1428,43 +1561,57 @@ static int CIRCLE_send_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, \
     /* total number of ints we'll send */
     int numoffsets = 2 + count;
 
-    /* Check to see if the offset array is large enough */
-    if(CIRCLE_extend_offsets(st, numoffsets) < 0) {
-        LOG(CIRCLE_LOG_ERR, "Error: Unable to extend offsets.");
+    /* These sends must not block.  A process that blocks in a send
+     * stops receiving, which stalls its peers and can hang the job.
+     * Since we don't wait on them, both messages are sent from buffers
+     * we allocate here rather than from the queue, whose memory is
+     * reallocated as it grows and is overwritten as soon as the next
+     * item is pushed. */
+    int* offsets = (int*) malloc((size_t)numoffsets * sizeof(int));
+    char* buf = (char*) malloc((size_t)bytes);
+
+    if(offsets == NULL || buf == NULL) {
+        LOG(CIRCLE_LOG_FATAL, "Failed to allocate memory to send work.");
+        MPI_Abort(st->comm, LIBCIRCLE_MPI_ERROR);
         return -1;
     }
 
     /* offsets[0] = number of strings */
     /* offsets[1] = number of chars being sent */
-    st->offsets_send_buf[0] = (int) count;
-    st->offsets_send_buf[1] = (int) bytes;
+    offsets[0] = (int) count;
+    offsets[1] = (int) bytes;
 
     /* now compute offset of each string */
     int32_t i = 0;
     int32_t current_elem = start_elem;
 
     for(i = 0; i < count; i++) {
-        st->offsets_send_buf[2 + i] = (int)(qp->strings[current_elem] - start_offset);
+        offsets[2 + i] = (int)(qp->strings[current_elem] - start_offset);
         current_elem++;
     }
 
-    /* TODO; use isend to avoid deadlock, but in that case, be careful
-     * to not overwrite space in queue before sends complete */
+    /* copy the items out of the queue */
+    memcpy(buf, qp->base + start_offset, (size_t)bytes);
 
     /* get communicator */
     MPI_Comm comm = st->comm;
 
+    /* MPI guarantees these are matched in the order we post them, so
+     * the receiver still gets the offsets before the data */
+    MPI_Request req;
+
     /* send item count, total bytes, and offsets of each item */
-    MPI_Send(st->offsets_send_buf, numoffsets, MPI_INT, dest,
-             CIRCLE_TAG_WORK_REPLY, comm);
+    MPI_Isend(offsets, numoffsets, MPI_INT, dest,
+              CIRCLE_TAG_WORK_REPLY, comm, &req);
+    CIRCLE_worksend_track(st, req, offsets);
 
     /* send data */
-    char* buf = qp->base + start_offset;
-    MPI_Send(buf, bytes, MPI_CHAR, dest,
-             CIRCLE_TAG_WORK_REPLY, comm);
+    MPI_Isend(buf, bytes, MPI_CHAR, dest,
+              CIRCLE_TAG_WORK_REPLY, comm, &req);
+    CIRCLE_worksend_track(st, req, buf);
 
     LOG(CIRCLE_LOG_DBG,
-        "Sent %d of %d items to %d.", st->offsets_send_buf[0], qp->count, dest);
+        "Sent %d of %d items to %d.", (int) count, qp->count, dest);
 
     /* subtract elements from our queue */
     qp->count -= count;
@@ -1619,14 +1766,25 @@ void CIRCLE_workreq_check(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, int 
         return;
     }
 
+    /* every work transfer we post holds a copy of its items until the
+     * send completes, so stop transferring work once we have a lot of
+     * sends in flight, rather than letting a slow peer run us out of
+     * memory.  requestors we turn away simply ask again */
+    int send_backlog = (st->send_count >= 4 * st->size);
+
+    if(send_backlog) {
+        LOG(CIRCLE_LOG_DBG,
+            "Deferring work transfer, %d sends outstanding.", st->send_count);
+    }
+
     /* send work to requestors */
-    if(qp->count == 0 || cleanup || CIRCLE_ABORT_FLAG) {
+    if(qp->count == 0 || cleanup || CIRCLE_ABORT_FLAG || send_backlog) {
         /* we send "no work" messages back if we have no work,
-         * we are in a cleanup phase, or we have received an
-         * abort message */
+         * we are in a cleanup phase, we have received an
+         * abort message, or we have too many sends in flight */
         int i;
         for(i = 0; i < rcount; i++) {
-            CIRCLE_send_no_work(requestors[i]);
+            CIRCLE_send_no_work(st, requestors[i]);
         }
     }
     else {

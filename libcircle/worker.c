@@ -152,7 +152,6 @@ static void CIRCLE_init_local_state(MPI_Comm comm, CIRCLE_state_st* local_state)
     /* allocate memory for our offset arrays */
     int32_t offsets = CIRCLE_INPUT_ST.queue->str_count;
     local_state->offsets_count = offsets;
-    local_state->offsets_send_buf = (int*) calloc((size_t)offsets, sizeof(int));
     local_state->offsets_recv_buf = (int*) calloc((size_t)offsets, sizeof(int));
 
     /* allocate array for work request */
@@ -165,6 +164,13 @@ static void CIRCLE_init_local_state(MPI_Comm comm, CIRCLE_state_st* local_state)
 
     /* initialize work request state */
     local_state->work_requested = 0;
+    local_state->work_request_req = MPI_REQUEST_NULL;
+
+    /* initialize state used to track non-blocking sends */
+    local_state->send_count    = 0;
+    local_state->send_capacity = 0;
+    local_state->send_reqs     = NULL;
+    local_state->send_bufs     = NULL;
 
     /* determine whether we are using tree-based or circle-based
      * termination detection */
@@ -248,8 +254,8 @@ void CIRCLE_free(void* pptr)
 static void CIRCLE_finalize_local_state(CIRCLE_state_st* local_state)
 {
     CIRCLE_tree_free(&local_state->tree);
+    CIRCLE_worksend_free(local_state);
     CIRCLE_free(&local_state->abort_req);
-    CIRCLE_free(&local_state->offsets_send_buf);
     CIRCLE_free(&local_state->offsets_recv_buf);
     CIRCLE_free(&local_state->requestors);
     return;
@@ -359,6 +365,9 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
 
         /* process any incoming work receipt messages */
         CIRCLE_workreceipt_check(CIRCLE_INPUT_ST.queue, sptr);
+
+        /* release buffers of any sends that have completed */
+        CIRCLE_worksend_check(sptr);
 
         /* check for incoming abort messages */
         CIRCLE_abort_check(sptr, cleanup);
@@ -481,10 +490,14 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
     /* clear up any MPI messages that may still be outstanding */
     while(1) {
         /* start a non-blocking barrier once we have no outstanding
-         * items */
+         * items, this includes any non-blocking send we posted, since
+         * its buffer is not ours to free until the send completes and
+         * a stray message would confuse the next invocation */
         if(! sptr->work_requested     &&
            ! sptr->reduce_outstanding &&
            ! sptr->abort_outstanding  &&
+           sptr->send_count == 0      &&
+           sptr->work_request_req == MPI_REQUEST_NULL &&
            sptr->token_send_req == MPI_REQUEST_NULL)
         {
             CIRCLE_barrier_start(sptr);
@@ -497,6 +510,9 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
 
         /* send no work message for any work request that comes in */
         CIRCLE_workreq_check(CIRCLE_INPUT_ST.queue, sptr, cleanup);
+
+        /* release buffers of any sends that have completed */
+        CIRCLE_worksend_check(sptr);
 
         /* cleanup any outstanding reduction */
         if(sptr->reduce_enabled) {
@@ -523,6 +539,11 @@ static void CIRCLE_work_loop(CIRCLE_state_st* sptr, CIRCLE_handle* q_handle)
             }
         }
     }
+
+    /* The barrier has completed, so every process has received
+     * everything we sent it.  Collect our sends and release their
+     * buffers before we go any further. */
+    CIRCLE_worksend_wait(sptr);
 
     /* execute final, synchronous reduction if enabled, this ensures
      * that we fire at least one reduce and one with the final result */

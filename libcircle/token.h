@@ -59,9 +59,8 @@ typedef struct CIRCLE_state_st {
     MPI_Request token_send_req;  /* request associated with pending receive */
 
     /* offset arrays are used to transfer length of items while sending work */
-    int offsets_count;     /* number of offsets in work and request offset arrays */
+    int offsets_count;     /* number of offsets in work offset array */
     int* offsets_recv_buf; /* buffer in which to receive an array of offsets when receiving work */
-    int* offsets_send_buf; /* buffer to specify offsets while sending work */
 
     /* these are used for persistent receives of work request messages
      * from other tasks */
@@ -74,6 +73,17 @@ typedef struct CIRCLE_state_st {
     /* manage state for requesting work from other procs */
     int work_requested;             /* flag indicating we have requested work */
     int work_requested_rank;        /* rank of process we requested work from */
+    MPI_Request work_request_req;   /* request for our outstanding work request message */
+
+    /* we never block in a send on the work transfer path, since a process
+     * that is blocked in a send stops servicing incoming messages, which
+     * stalls every other process that is waiting on it.  instead we post
+     * non-blocking sends and hold on to the request and its buffer until
+     * the send completes */
+    int send_count;         /* number of outstanding sends */
+    int send_capacity;      /* allocated length of arrays below */
+    MPI_Request* send_reqs; /* request for each outstanding send */
+    void** send_bufs;       /* buffer backing each outstanding send, may be NULL */
 
     /* tree used for collective operations */
     CIRCLE_tree_state_st tree;   /* parent and children of tree */
@@ -166,6 +176,16 @@ int  CIRCLE_check_for_term_allreduce(CIRCLE_state_st* st);
 void CIRCLE_workreceipt_check(CIRCLE_internal_queue_t* queue,
                           CIRCLE_state_st* state);
 
+/* reap any non-blocking sends that have completed, freeing their buffers */
+void CIRCLE_worksend_check(CIRCLE_state_st* state);
+
+/* wait for all outstanding sends to complete and free their buffers,
+ * only valid once the cleanup barrier has completed */
+void CIRCLE_worksend_wait(CIRCLE_state_st* state);
+
+/* free memory allocated to track outstanding sends */
+void CIRCLE_worksend_free(CIRCLE_state_st* state);
+
 void CIRCLE_workreq_check(CIRCLE_internal_queue_t* queue,
                           CIRCLE_state_st* state,
                           int cleanup);
@@ -174,7 +194,7 @@ int32_t CIRCLE_request_work(CIRCLE_internal_queue_t* queue,
                             CIRCLE_state_st* state,
                             int cleanup);
 
-void CIRCLE_send_no_work(int32_t dest);
+void CIRCLE_send_no_work(CIRCLE_state_st* state, int32_t dest);
 
 int8_t CIRCLE_extend_offsets(CIRCLE_state_st* st, int32_t size);
 
