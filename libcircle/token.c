@@ -1393,7 +1393,30 @@ static int CIRCLE_send_work(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st, \
     size_t len = end_offset - start_offset;
     len += strlen(qp->base + end_offset) + 1;
 
-    /* TODO: check that len doesn't overflow an int */
+    /* If total byte count exceeds the length MPI_Send can handle
+     * then back off by reducing the number of items to send; the
+     * remaining items stay in our queue and will be sent later. */
+    while(len > INT32_MAX && count > 1) {
+        int32_t next = count - (count / 10);
+        if(next >= count) {
+            next = count - 1;
+        }
+
+        count = next;
+        start_elem = qp->count - count;
+        start_offset = qp->strings[start_elem];
+        len = end_offset - start_offset;
+        len += strlen(qp->base + end_offset) + 1;
+    }
+
+    if(len > INT32_MAX) {
+        LOG(CIRCLE_LOG_ERR,
+            "Single work item too large to send (%zu bytes).", len);
+        CIRCLE_send_no_work(dest);
+        return -1;
+    }
+
+    /* this cast is safe because we ensured len <= INT32_MAX */
     int bytes = (int) len;
 
     /* total number of ints we'll send */
