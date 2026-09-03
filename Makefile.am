@@ -1,11 +1,9 @@
 include $(top_srcdir)/common.mk
 
-SUBDIRS = doc
-
-# add in unit tests if we found libcheck
-if HAVE_CHECK
-  SUBDIRS += tests
-endif
+# tests/ holds the libcheck unit tests, which build only when libcheck
+# was found, plus the multi-rank regression test, which does not need
+# libcheck, so the directory is always visited
+SUBDIRS = doc tests
 
 AUTOMAKE_OPTIONS = subdir-objects foreign
 ACLOCAL_AMFLAGS = -I m4 ${ACLOCAL_FLAGS}
