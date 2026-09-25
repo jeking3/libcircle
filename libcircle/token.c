@@ -1677,6 +1677,10 @@ static void CIRCLE_send_work_to_many(CIRCLE_internal_queue_t* qp, \
  */
 void CIRCLE_workreceipt_check(CIRCLE_internal_queue_t* qp, CIRCLE_state_st* st)
 {
+    /* qp is unused in this function, kept for API symmetry with
+     * CIRCLE_workreq_check() */
+    (void) qp;
+
     /* get MPI communicator */
     MPI_Comm comm = st->comm;
 
